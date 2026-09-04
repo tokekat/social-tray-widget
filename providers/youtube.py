@@ -20,6 +20,16 @@ that views of since-deleted videos, which the channel aggregate keeps for
 ever, drop out of the sum. The channel counter is still used as a fallback
 when the walk is off or has never succeeded.
 
+Per-video counts are current but not consistent: the same video answers 804
+views one call and 801 the next, seconds apart, from whichever replica the
+request lands on. Summed over a channel that makes a walk land a few views
+below the previous one whenever real growth is slower than the jitter (a
+quiet night), and the popup shows a small minus. A walk that returns no fewer
+videos than the last one but fewer views is therefore held for a pass and
+believed only when the next walk repeats it (base.stale_strike). That
+catches the single low read; two in a row still show, briefly, until growth
+overtakes them.
+
 Quota, the reason the walk is cached: the daily budget is 10,000 units.
 channels.list is 1 unit, so polling followers every minute costs 1,440 a day —
 14%. The walk reads the uploads playlist and then statistics 50 videos at a
@@ -43,7 +53,7 @@ import urllib.parse
 
 import requests
 
-from .base import Metrics, Provider
+from .base import Metrics, Provider, stale_strike
 from ..oauth import LoopbackCapture
 
 log = logging.getLogger("social.youtube")
@@ -149,6 +159,7 @@ class YouTubeProvider(Provider):
         items = r.json().get("items", [])
         if not items:
             return Metrics(ok=False, error="no channel for this account")
+        self._track_channel(str(items[0].get("id") or ""))
         st = items[0].get("statistics", {})
         uploads = ((items[0].get("contentDetails") or {})
                    .get("relatedPlaylists") or {}).get("uploads", "")
@@ -158,6 +169,26 @@ class YouTubeProvider(Provider):
 
     def _auth(self) -> dict:
         return {"Authorization": f"Bearer {self.tokens.access_token}"}
+
+    def _track_channel(self, cid: str) -> None:
+        """Record the channel behind the token and, when it CHANGES (a re-auth
+        into another Google account), drop the previous channel's cached walk.
+        The token file survives a re-auth with its `extra` intact, so without
+        this the old channel's totals would be served for the rest of the
+        window and then defended by the stale-read guard against the new
+        channel's first walk as a "drop". A first sighting only records the
+        id and trusts an existing cache to be this channel's, so a switch
+        made before this build costs at most one extra window, once.
+        Mirrors vk._VKBase._track_group."""
+        extra = self.tokens.extra
+        prev  = str(extra.get("channel_id") or "")
+        if not cid or cid == prev:
+            return
+        if prev:
+            for k in ("views_total", "likes_total", "items_count",
+                      "stale_strikes", "walk_at", "likes_at"):
+                extra.pop(k, None)
+        self.tokens.set_extra("channel_id", cid)
 
     # ── uploads walk: views + likes ─────────────────────────────────────────
     def _walk_totals(self, uploads: str, channel_views: int) -> tuple:
@@ -172,30 +203,45 @@ class YouTubeProvider(Provider):
         """
         if not self.config.get("count_likes", True) or not uploads:
             return channel_views, None
-        extra = self.tokens.extra
-        have  = "views_total" in extra and "likes_total" in extra
-        every = int(self.config.get("likes_refresh_min", 15)) * 60
+        extra  = self.tokens.extra
+        have   = "views_total" in extra and "likes_total" in extra
+        cached = ((int(extra["views_total"]), int(extra["likes_total"]))
+                  if have else None)
+        every  = int(self.config.get("likes_refresh_min", 15)) * 60
         if have and time.time() < extra.get("walk_at", 0) + every:
-            return int(extra["views_total"]), int(extra["likes_total"])
+            return cached
         try:
-            views, likes = self._sum_uploads(uploads)
+            views, likes, n = self._sum_uploads(uploads)
         except Exception:
             # The walk is the extra; never let it cost us the follower count.
             log.exception("youtube: uploads walk failed, reusing cached values")
             if have:
-                return int(extra["views_total"]), int(extra["likes_total"])
+                return cached
             likes = extra.get("likes_total")   # pre-views_total token files
             return channel_views, None if likes is None else int(likes)
-        # One write: the two sums and their timestamp belong together. Drop
-        # the pre-views-walk stamp so an upgraded token file doesn't keep it.
+        # Stale-read guard (base.stale_strike): per-video viewCount jitters
+        # between reads, so "no fewer videos, fewer views" is held for one pass —
+        # only once there is a cache to hold. The held pass is stamped like a
+        # real one: the cadence, and with it the quota, must not depend on
+        # which replica answered.
+        strike = stale_strike(log, extra, self.name, n, views) if have else 0
+        if strike:
+            self.tokens.update_extra({"stale_strikes": strike,
+                                      "walk_at": time.time()})
+            return cached
+        # One write: the sums, their video count and timestamp belong
+        # together. Drop the pre-views-walk stamp so an upgraded token file
+        # doesn't keep it.
         self.tokens.extra.pop("likes_at", None)
         self.tokens.update_extra({"views_total": views, "likes_total": likes,
-                                  "walk_at": time.time()})
+                                  "items_count": n, "walk_at": time.time(),
+                                  "stale_strikes": 0})
         return views, likes
 
     def _sum_uploads(self, uploads: str) -> tuple:
+        """(views, likes, videos summed) over the uploads playlist."""
         ids   = self._upload_ids(uploads)
-        views = likes = 0
+        views = likes = n = 0
         for i in range(0, len(ids), _PER_PAGE):
             r = requests.get(_VIDEOS, params={
                 "part": "statistics", "id": ",".join(ids[i:i + _PER_PAGE]),
@@ -209,7 +255,8 @@ class YouTubeProvider(Provider):
                 views += int(st.get("viewCount") or 0)
                 # likeCount is absent when the uploader hides it.
                 likes += int(st.get("likeCount") or 0)
-        return views, likes
+                n += 1
+        return views, likes, n
 
     def _upload_ids(self, uploads: str) -> list:
         ids, page = [], None
